@@ -111,7 +111,7 @@ describe(`RTokenP${IMPLEMENTATION} contract`, () => {
   ) => {
     if (IMPLEMENTATION == Implementation.P0) {
       const rTokenP0 = <RTokenP0>await ethers.getContractAt('RTokenP0', rToken.address)
-      const [, amount, baskets, basketNonce, blockAvailableAt, processed] =
+      const [, amount, baskets, basketNonce, , blockAvailableAt, processed] =
         await rTokenP0.issuances(account, index)
 
       if (issuance.amount) expect(amount.toString()).to.eql(issuance.amount.toString())
@@ -127,12 +127,12 @@ describe(`RTokenP${IMPLEMENTATION} contract`, () => {
     } else if (IMPLEMENTATION == Implementation.P1) {
       const rTokenP1 = <RTokenP1>await ethers.getContractAt('RTokenP1', rToken.address)
       const [basketNonce, left] = await rTokenP1.issueQueues(account)
-      const [, amtRTokenPrev, amtBasketsPrev] = await rTokenP1.issueItem(
+      const [, , amtRTokenPrev, amtBasketsPrev] = await rTokenP1.issueItem(
         account,
         index == 0 ? index : index - 1
       )
 
-      const [when, amtRToken, amtBaskets] = await rTokenP1.issueItem(account, index)
+      const [when, , amtRToken, amtBaskets] = await rTokenP1.issueItem(account, index)
 
       const amt = index == 0 ? amtRTokenPrev : amtRToken.sub(amtRTokenPrev)
       const baskets = index == 0 ? amtBasketsPrev : amtBaskets.sub(amtBasketsPrev)
@@ -215,7 +215,7 @@ describe(`RTokenP${IMPLEMENTATION} contract`, () => {
     initialBasketNonce = BigNumber.from(await basketHandler.nonce())
 
     // Mint initial balances
-    initialBal = bn('40000e18')
+    initialBal = bn('1e24')
     await Promise.all(
       tokens.map((t) =>
         Promise.all([
@@ -1673,6 +1673,36 @@ describe(`RTokenP${IMPLEMENTATION} contract`, () => {
       // Should have initial tokens back, up to 1 less. Not more
       expect(await token0.balanceOf(addr1.address)).to.be.lte(beforeBal)
       expect(await token0.balanceOf(addr1.address)).to.be.closeTo(beforeBal, 1)
+    })
+
+    it('Should not be able to DOS allVestAt via cancel', async () => {
+      // Provide approvals
+      await Promise.all(
+        tokens.map((t) => Promise.all([t.connect(addr1).approve(rToken.address, initialBal)]))
+      )
+
+      const issueAmount: BigNumber = MIN_ISSUANCE_PER_BLOCK.mul(10) // takes 10 blocks to vest
+
+      // Start 2 issuances, each 10 blocks wide
+      await rToken.connect(addr1)['issue(uint256)'](issueAmount)
+      await rToken.connect(addr1)['issue(uint256)'](issueAmount)
+
+      // Issuances should be non-atomic
+      expect(await rToken.balanceOf(addr1.address)).to.equal(0)
+      expect(await rToken.allVestAt()).to.be.gt(fp(await getLatestBlockNumber()))
+
+      // Cancel first issuance - allVestAt should be in future
+      await rToken.connect(addr1).cancel(1, true)
+      expect(await rToken.allVestAt()).to.be.gt(fp(await getLatestBlockNumber()))
+
+      // Cancel second issuance - allVestAt should be in past
+      await rToken.connect(addr1).cancel(2, true)
+      expect(await rToken.allVestAt()).to.be.lt(fp(await getLatestBlockNumber()))
+
+      // A new small issuance should happen immediately - allVestAt should be current block
+      await rToken.connect(addr1)['issue(uint256)'](MIN_ISSUANCE_PER_BLOCK)
+      expect(await rToken.balanceOf(addr1.address)).to.equal(MIN_ISSUANCE_PER_BLOCK)
+      expect(await rToken.allVestAt()).to.be.eq(fp(await getLatestBlockNumber()))
     })
   })
 

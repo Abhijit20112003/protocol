@@ -169,6 +169,9 @@ interface IRToken is
 }
 
 interface TestIRToken is IRToken {
+    /// @return D18{block} The fractional block when all issuances vest
+    function allVestAt() external view returns (uint192);
+
     /// Set the issuance rate as a % of RToken supply
     function setIssuanceRate(uint192) external;
 
