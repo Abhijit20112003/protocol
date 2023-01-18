@@ -23,6 +23,7 @@ struct SlowIssuance {
     address[] erc20s;
     uint256[] deposits;
     uint256 basketNonce;
+    uint192 blocksUsed; // {block.number} fractional
     uint192 blockAvailableAt; // {block.number} fractional
     bool processed;
 }
@@ -76,6 +77,7 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
     // IssueItem: One edge of an issuance
     struct IssueItem {
         uint192 when; // D18{fractional block number}
+        uint192 blocksUsed; // D18{fractional block number} how many blocks the issuance uses
         uint256 amtRToken; // {qRTok} Total amount of RTokens that have vested by `when`
         uint192 amtBaskets; // D18{BU} Total amount of baskets that should back those RTokens
         uint256[] deposits; // {qTok}, Total amounts of basket collateral deposited for vesting
@@ -175,6 +177,7 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
 
         // Add a new SlowIssuance ticket to the queue
         uint48 basketNonce = main.basketHandler().nonce();
+        (uint192 blocksUsed, uint192 avaiableAt) = whenFinished(amount); // D18{block number}
         SlowIssuance memory iss = SlowIssuance({
             recipient: recipient,
             amount: amount,
@@ -182,7 +185,8 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
             erc20s: erc20s,
             deposits: deposits,
             basketNonce: basketNonce,
-            blockAvailableAt: nextIssuanceBlockAvailable(amount),
+            blocksUsed: blocksUsed,
+            blockAvailableAt: avaiableAt,
             processed: false
         });
         issuances[recipient].push(iss);
@@ -248,6 +252,7 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
                     liabilities[IERC20(iss.erc20s[i])] -= iss.deposits[i];
                     IERC20(iss.erc20s[i]).safeTransfer(iss.recipient, iss.deposits[i]);
                 }
+                allVestAt -= iss.blocksUsed;
                 amtRToken += iss.amount;
                 iss.processed = true;
                 numCanceled++;
@@ -460,7 +465,12 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
     }
 
     /// Returns the block number at which an issuance for *amount* now can complete
-    function nextIssuanceBlockAvailable(uint256 amount) private returns (uint192) {
+    /// @return blocksUsed D18{block} How many blocks this issuance uses
+    /// @return availableAt D18{block} The block number when this issuance becomes avaiable
+    function whenFinished(uint256 amount)
+        private
+        returns (uint192 blocksUsed, uint192 availableAt)
+    {
         uint192 before = fixMax(toFix(block.number - 1), allVestAt);
 
         // Calculate the issuance rate if this is the first issue in the block
@@ -471,8 +481,9 @@ contract RTokenP0 is ComponentP0, RewardableP0, ERC20PermitUpgradeable, IRToken 
             );
         }
         uint256 perBlock = blockIssuanceRates[block.number];
-        allVestAt = before.plus(FIX_ONE.muluDivu(amount, perBlock, CEIL));
-        return allVestAt;
+        blocksUsed = FIX_ONE.muluDivu(amount, perBlock, CEIL);
+        availableAt = before.plus(blocksUsed);
+        allVestAt = availableAt;
     }
 
     function refundAndClearStaleIssuances(address account) private returns (bool) {

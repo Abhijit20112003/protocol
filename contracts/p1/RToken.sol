@@ -79,6 +79,7 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
     // IssueItem: One edge of an issuance
     struct IssueItem {
         uint192 when; // D18{fractional block number}
+        uint192 blocksUsed; // D18{fractional block number} how many blocks the issuance uses
         uint256 amtRToken; // {qRTok} Total amount of RTokens that have vested by `when`
         uint192 amtBaskets; // D18{BU} Total amount of baskets that should back those RTokens
         uint256[] deposits; // {qTok}, Total amounts of basket collateral deposited for vesting
@@ -240,7 +241,7 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         );
 
         // Add amtRToken's worth of issuance delay to allVestAt
-        uint192 vestingEnd = whenFinished(amtRToken); // D18{block number}
+        (uint192 blocksUsed, uint192 vestingEnd) = whenFinished(amtRToken); // D18{block number}
 
         // ==== If the issuance can fit in this block, and nothing is blocking it, then
         // just do a "quick issuance" of iss instead of putting the issuance in the queue:
@@ -295,6 +296,7 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         if (queue.right > 0) {
             IssueItem storage prev = queue.items[queue.right - 1];
             curr.amtRToken = prev.amtRToken + amtRToken;
+            curr.blocksUsed = prev.blocksUsed + blocksUsed;
 
             // D18{BU} = D18{BU} + D18{BU}; uint192(+) is the same as Fix.plus
             curr.amtBaskets = prev.amtBaskets + amtBaskets;
@@ -306,6 +308,7 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         } else {
             // queue.right == 0
             curr.amtRToken = amtRToken;
+            curr.blocksUsed = blocksUsed;
             curr.amtBaskets = amtBaskets;
             curr.deposits = deposits;
         }
@@ -340,8 +343,9 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
     }
 
     /// Add amtRToken's worth of issuance delay to allVestAt, and return the resulting finish time.
+    /// @return width D18{block} The width of the RToken amount in number of blocks
     /// @return finished D18{block} The new value of allVestAt
-    function whenFinished(uint256 amtRToken) private returns (uint192 finished) {
+    function whenFinished(uint256 amtRToken) private returns (uint192 width, uint192 finished) {
         // Calculate the issuance rate (if this is the first issuance in the block)
         if (lastIssRateBlock < block.number) {
             lastIssRateBlock = block.number;
@@ -365,7 +369,8 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         //   lastIssRate is at least 1e24 (from MIN_ISS_RATE), and
         //   amtRToken is at most 1e48, so
         //   what's downcast is at most (1e18 * 1e48 / 1e24) = 1e38 < 2^192-1
-        finished = before + uint192((FIX_ONE_256 * amtRToken + (lastIssRate - 1)) / lastIssRate);
+        width = uint192((FIX_ONE_256 * amtRToken + (lastIssRate - 1)) / lastIssRate);
+        finished = before + width;
         allVestAt = finished;
     }
 
@@ -375,7 +380,9 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
     /// @custom:completion
     /// @custom:interaction CEI
     // Thin wrapper over refundSpan() and vestUpTo(); see those for correctness analysis
-    function vest(address account, uint256 endId) external notPausedOrFrozen {
+    function vest(address account, uint256 endId) external {
+        requireNotPausedOrFrozen();
+
         // == Keepers ==
         main.assetRegistry().refresh();
 
@@ -566,7 +573,8 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
     // effects:
     //   bal'[caller] = bal[caller] - amtRToken
     //   totalSupply' = totalSupply - amtRToken
-    function melt(uint256 amtRToken) external notPausedOrFrozen {
+    function melt(uint256 amtRToken) external {
+        requireNotPausedOrFrozen();
         _burn(_msgSender(), amtRToken);
         emit Melted(amtRToken);
         requireValidBUExchangeRate();
@@ -665,12 +673,14 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         uint256 tokensLen = queue.tokens.length;
         uint256[] memory amt = new uint256[](tokensLen);
         uint256 amtRToken; // {qRTok}
+        uint192 blocksUsed; // D18{block}
         IssueItem storage rightItem = queue.items[right - 1];
 
         // compute item(right-1) - item(left-1)
         // we could dedup this logic for the zero item, but it would take more SLOADS
         if (left == 0) {
             amtRToken = rightItem.amtRToken;
+            blocksUsed = rightItem.blocksUsed;
             for (uint256 i = 0; i < tokensLen; ++i) {
                 amt[i] = rightItem.deposits[i];
 
@@ -680,6 +690,7 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
         } else {
             IssueItem storage leftItem = queue.items[left - 1];
             amtRToken = rightItem.amtRToken - leftItem.amtRToken;
+            blocksUsed = rightItem.blocksUsed - leftItem.blocksUsed;
             for (uint256 i = 0; i < tokensLen; ++i) {
                 amt[i] = rightItem.deposits[i] - leftItem.deposits[i];
 
@@ -687,6 +698,9 @@ contract RTokenP1 is ComponentP1, ERC20PermitUpgradeable, IRToken {
                 liabilities[IERC20(queue.tokens[i])] -= amt[i];
             }
         }
+
+        // Update allVestAt
+        allVestAt -= blocksUsed;
 
         if (queue.left == left && right == queue.right) {
             // empty entire queue
